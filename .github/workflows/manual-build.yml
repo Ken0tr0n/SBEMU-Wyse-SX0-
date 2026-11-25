@@ -1,0 +1,49 @@
+name: manual-build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: src
+          fetch-depth: 0
+
+      - name: Install DJGPP
+        run: |
+          wget -P /tmp https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-linux64-gcc1220.tar.bz2
+          echo "8464f17017d6ab1b2bb2df4ed82357b5bf692e6e2b7fee37e315638f3d505f00  /tmp/djgpp-linux64-gcc1220.tar.bz2" | shasum -a 256 --check
+          tar -xf /tmp/djgpp-linux64-gcc1220.tar.bz2 -C /opt
+          rm /tmp/djgpp-linux64-gcc1220.tar.bz2
+
+      - name: Build project
+        run: |
+          cd $GITHUB_WORKSPACE/src
+          . /opt/djgpp/setenv
+          make
+          test -f output/sbemu.exe
+
+      - name: Upload sbemu.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbemu-exe
+          path: src/output/sbemu.exe
+
+      - name: Build FreeDOS USB image and ZIP
+        continue-on-error: true
+        run: |
+          cp $GITHUB_WORKSPACE/src/user_instructions.md $GITHUB_WORKSPACE/RELEASE_NOTES.md
+          $GITHUB_WORKSPACE/src/scripts/build-release-artifacts.sh $GITHUB_WORKSPACE/src/output/sbemu.exe $GITHUB_WORKSPACE/RELEASE_NOTES.md $GITHUB_WORKSPACE/
+
+      - name: Upload SBEMU zip and USB image
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbemu-usb-image
+          path: |
+            SBEMU.zip
+            SBEMU-FD14-USB.img.xz
+          if-no-files-found: warn
