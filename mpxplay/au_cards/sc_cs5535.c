@@ -3,11 +3,15 @@
 // Based on Linux snd_cs5535audio (sound/pci/cs5535audio/) and the AMD CS5536 datasheet.
 //
 // Hardware summary:
-//   - Single PCI BAR0 (I/O port space) for all ACC registers
+//   - Single PCI BAR0 (I/O port space, 128 bytes) for all ACC registers
 //   - AC97 codec access via ACC_CODEC_CNTL / ACC_CODEC_STATUS (not a separate I/O range)
 //   - Bus-master DMA uses a Physical Region Descriptor (PRD) table with a JMP-back entry
 //     for circular, interrupt-per-period playback
 //   - Position tracked via ACC_BM0_PNTR (current physical DMA byte address)
+//
+// Tested hardware data (Wyse SX0, lspci/ALSA):
+//   PCI 1022:2093 rev 01, BAR0 = I/O 0xEE00 (size 128), IRQ 5 (INTB), codec Realtek ALC655,
+//   extended audio id shows no VRA -> fixed 48 kHz.
 
 #include "au_cards.h"
 
@@ -26,6 +30,7 @@
 #define ACC_BM0_CMD       0x20  // Bus Master 0 (playback) command byte
 #define ACC_BM0_STATUS    0x21  // Bus Master 0 status byte
 #define ACC_BM0_PRD       0x24  // BM0 PRD table address (physical, 32-bit)
+#define ACC_BM1_STATUS    0x29  // Bus Master 1 (capture) status byte
 #define ACC_BM0_PNTR      0x60  // BM0 current DMA byte pointer (physical, 32-bit)
 
 // ACC_CODEC_CNTL bit fields
@@ -37,7 +42,7 @@
 
 // ACC_CODEC_STATUS bit fields
 #define CS_STS_NEW       0x00020000u  // new read result available
-#define CS_PRM_RDY       0x00800000u  // codec ready after warm reset
+#define CS_PRM_RDY       0x00800000u  // primary codec ready
 
 // IRQ status bits (ACC_IRQ_STATUS, 16-bit)
 #define CS_IRQ_CODEC_STS  (1u << 0)
@@ -50,20 +55,20 @@
 #define CS_BM_DIS         0x00
 #define CS_BM_PAUSE       0x03
 
-// BM0 status bits
-#define CS_BM_EOP         0x01  // End-Of-Period interrupt
-#define CS_BM_ERR         0x02  // DMA error
-
 // PRD descriptor control flags (ctlreserved field)
 #define CS_PRD_EOP        0x4000u  // generate interrupt when this entry finishes
 #define CS_PRD_JMP        0x2000u  // addr field is next PRD table address (jump)
 #define CS_PRD_EOT        0x8000u  // stop DMA after this entry
 
+#define AC97_POWERDOWN_CTRL 0x26   // AC97 power-down control/status register
+
 #define CS5535_PERIODS        8   // number of audio buffer periods
 #define CS5535_PRD_COUNT      (CS5535_PERIODS + 1)  // +1 for the JMP entry
-#define CS5535_PRD_TABLE_SIZE (CS5535_PRD_COUNT * sizeof(struct cs5535_prd))
-// Must be >= PRD table size; doubled for safety; keep power-of-2 aligned
+// The PRD table lives in its own 256-byte block in front of the audio buffer,
+// so the audio buffer is nicely aligned too.
+#define CS5535_PRD_REGION     256
 #define CS5535_BDL_ALIGN      256
+#define CS5535_MAX_PERIOD     0xFFF0u   // PRD size field is 16 bit
 
 #define CS5535_CODEC_TIMEOUT  500
 
@@ -85,13 +90,17 @@ typedef struct cs5535_card_s {
 
     unsigned int         period_size_bytes;
     unsigned char        vra;
+
+    uint16_t             codec_id1;    // AC97 vendor id (for the startup banner)
+    uint16_t             codec_id2;
+    uint16_t             codec_ext_id; // AC97 extended audio id
+    unsigned char        codec_ready;
 } cs5535_card_s;
 
 // ---------------------------------------------------------------------------
 // Register access helpers
 
 static inline void cs_writeb(cs5535_card_s *card, unsigned int reg, uint8_t v)  { outb(card->iobase + reg, v); }
-static inline void cs_writew(cs5535_card_s *card, unsigned int reg, uint16_t v) { outw(card->iobase + reg, v); }
 static inline void cs_writel(cs5535_card_s *card, unsigned int reg, uint32_t v) { outl(card->iobase + reg, v); }
 static inline uint8_t  cs_readb(cs5535_card_s *card, unsigned int reg) { return inb(card->iobase + reg); }
 static inline uint16_t cs_readw(cs5535_card_s *card, unsigned int reg) { return inw(card->iobase + reg); }
@@ -100,6 +109,13 @@ static inline uint32_t cs_readl(cs5535_card_s *card, unsigned int reg) { return 
 // ---------------------------------------------------------------------------
 // AC97 codec access (via ACC_CODEC_CNTL / ACC_CODEC_STATUS)
 
+static void cs_wait_cmd_done(cs5535_card_s *card)
+{
+    int i = CS5535_CODEC_TIMEOUT;
+    while ((cs_readl(card, ACC_CODEC_CNTL) & CS_CMD_NEW) && --i)
+        pds_delay_10us(1);
+}
+
 static void cs_codec_write(cs5535_card_s *card, uint8_t reg, uint16_t val)
 {
     uint32_t cmd = ((uint32_t)reg << 24) | val;
@@ -107,30 +123,52 @@ static void cs_codec_write(cs5535_card_s *card, uint8_t reg, uint16_t val)
     cmd |= CS_CMD_NEW;
     // bit 31 = 0 for write
     cs_writel(card, ACC_CODEC_CNTL, cmd);
-
-    int i = CS5535_CODEC_TIMEOUT;
-    while ((cs_readl(card, ACC_CODEC_CNTL) & CS_CMD_NEW) && --i)
-        pds_delay_10us(1);
+    cs_wait_cmd_done(card);
 }
 
 static uint16_t cs_codec_read(cs5535_card_s *card, uint8_t reg)
 {
     uint32_t cmd = ((uint32_t)reg << 24) | CS_CODEC_RD | CS_CMD_NEW;
-    cs_writel(card, ACC_CODEC_CNTL, cmd);
-
-    // wait for write phase to complete
-    int i = CS5535_CODEC_TIMEOUT;
-    while ((cs_readl(card, ACC_CODEC_CNTL) & CS_CMD_NEW) && --i)
-        pds_delay_10us(1);
-
-    // wait for read result
     uint32_t status;
+    int i;
+
+    cs_writel(card, ACC_CODEC_CNTL, cmd);
+    cs_wait_cmd_done(card);
+
+    // wait for the read result (with a small delay per iteration)
     i = CS5535_CODEC_TIMEOUT;
     do {
         status = cs_readl(card, ACC_CODEC_STATUS);
-    } while ((!(status & CS_STS_NEW) || ((status >> 24) != reg)) && --i);
+        if ((status & CS_STS_NEW) && ((status >> 24) == reg))
+            break;
+        pds_delay_10us(1);
+    } while (--i);
 
     return (uint16_t)status;
+}
+
+// ---------------------------------------------------------------------------
+// AC-link: Linux does not reset the link at all (the BIOS brings the codec up),
+// so we only try a warm reset when the primary codec is NOT ready yet.
+
+static void cs_aclink_reset(cs5535_card_s *card)
+{
+    int i;
+
+    if (cs_readl(card, ACC_CODEC_STATUS) & CS_PRM_RDY) {
+        card->codec_ready = 1;
+        return;
+    }
+
+    cs_writel(card, ACC_CODEC_CNTL, CS_LNK_WRM_RST);
+    pds_delay_10us(100);
+
+    i = CS5535_CODEC_TIMEOUT;
+    while (!(cs_readl(card, ACC_CODEC_STATUS) & CS_PRM_RDY) && --i)
+        pds_delay_10us(100);
+
+    cs_writel(card, ACC_CODEC_CNTL, 0);   // release the warm-reset request, no codec command
+    card->codec_ready = (cs_readl(card, ACC_CODEC_STATUS) & CS_PRM_RDY) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,10 +176,14 @@ static uint16_t cs_codec_read(cs5535_card_s *card, uint8_t reg)
 
 static void cs_ac97_init(cs5535_card_s *card, unsigned int freq_set)
 {
+    // make sure all codec sections are powered up
+    cs_codec_write(card, AC97_POWERDOWN_CTRL, 0x0000);
+
     // unmute and set initial volumes
     cs_codec_write(card, AC97_MASTER_VOL_STEREO, 0x0202);
     cs_codec_write(card, AC97_PCMOUT_VOL,        0x0202);
     cs_codec_write(card, AC97_HEADPHONE_VOL,     0x0202);
+    cs_codec_write(card, AC97_CD_VOL,            0x0202);
 
     // enable VRA if we need a non-48 kHz rate
     if (freq_set != 48000) {
@@ -149,22 +191,11 @@ static void cs_ac97_init(cs5535_card_s *card, unsigned int freq_set)
         if (cs_codec_read(card, AC97_EXTENDED_STATUS) & AC97_EA_VRA)
             card->vra = 1;
     }
-}
 
-// ---------------------------------------------------------------------------
-// AC-link warm reset (ensures codec is alive after power-on)
-
-static void cs_aclink_reset(cs5535_card_s *card)
-{
-    cs_writel(card, ACC_CODEC_CNTL, CS_LNK_WRM_RST | CS_CMD_NEW);
-    int i = CS5535_CODEC_TIMEOUT;
-    while ((cs_readl(card, ACC_CODEC_CNTL) & CS_CMD_NEW) && --i)
-        pds_delay_10us(10);
-
-    // wait for codec ready
-    i = CS5535_CODEC_TIMEOUT;
-    while (!(cs_readl(card, ACC_CODEC_STATUS) & CS_PRM_RDY) && --i)
-        pds_delay_10us(10);
+    // remember some codec info for the startup banner
+    card->codec_id1    = cs_codec_read(card, AC97_VENDOR_ID1);
+    card->codec_id2    = cs_codec_read(card, AC97_VENDOR_ID2);
+    card->codec_ext_id = cs_codec_read(card, AC97_EXTENDED_ID);
 }
 
 // ---------------------------------------------------------------------------
@@ -174,12 +205,12 @@ static int cs_buffer_init(cs5535_card_s *card, struct mpxplay_audioout_info_s *a
 {
     card->pcmout_bufsize = MDma_get_max_pcmoutbufsize(aui, 0, CS5535_BDL_ALIGN, 2, 0);
 
-    card->dm = MDma_alloc_cardmem(CS5535_PRD_TABLE_SIZE + card->pcmout_bufsize);
+    card->dm = MDma_alloc_cardmem(CS5535_PRD_REGION + card->pcmout_bufsize);
     if (!card->dm)
         return 0;
 
-    card->prd_table    = (struct cs5535_prd *)card->dm->linearptr;
-    card->pcmout_buffer = card->dm->linearptr + CS5535_PRD_TABLE_SIZE;
+    card->prd_table     = (struct cs5535_prd *)card->dm->linearptr;
+    card->pcmout_buffer = card->dm->linearptr + CS5535_PRD_REGION;
 
     aui->card_DMABUFF = card->pcmout_buffer;
     memset(card->pcmout_buffer, 0, card->pcmout_bufsize);
@@ -191,6 +222,9 @@ static int cs_buffer_init(cs5535_card_s *card, struct mpxplay_audioout_info_s *a
 
 static void cs_prepare_playback(cs5535_card_s *card, struct mpxplay_audioout_info_s *aui)
 {
+    uint32_t buf_phys, prd_phys, jmp_phys;
+    int i;
+
     // Disable DMA before reconfiguring
     cs_writeb(card, ACC_BM0_CMD, CS_BM_DIS);
 
@@ -199,11 +233,11 @@ static void cs_prepare_playback(cs5535_card_s *card, struct mpxplay_audioout_inf
         cs_codec_write(card, AC97_PCM_FRONT_DAC_RATE, (uint16_t)aui->freq_card);
     pds_delay_10us(1600);
 
-    // Build PRD table
-    uint32_t buf_phys = (uint32_t)pds_cardmem_physicalptr(card->dm, card->pcmout_buffer);
-    uint32_t prd_phys = (uint32_t)pds_cardmem_physicalptr(card->dm, card->prd_table);
+    // Build PRD table (same layout as Linux cs5535audio_build_dma_packets)
+    buf_phys = (uint32_t)pds_cardmem_physicalptr(card->dm, card->pcmout_buffer);
+    prd_phys = (uint32_t)pds_cardmem_physicalptr(card->dm, (char *)card->prd_table);
 
-    for (int i = 0; i < CS5535_PERIODS; i++) {
+    for (i = 0; i < CS5535_PERIODS; i++) {
         card->prd_table[i].addr = buf_phys + (uint32_t)(i * card->period_size_bytes);
         card->prd_table[i].size = (uint16_t)card->period_size_bytes;
         card->prd_table[i].ctlreserved = CS_PRD_EOP;
@@ -214,10 +248,13 @@ static void cs_prepare_playback(cs5535_card_s *card, struct mpxplay_audioout_inf
     card->prd_table[CS5535_PERIODS].ctlreserved = CS_PRD_JMP;
 
     // ACC_BM0_PRD receives the physical address of the JMP descriptor
-    uint32_t jmp_phys = prd_phys + CS5535_PERIODS * sizeof(struct cs5535_prd);
+    jmp_phys = prd_phys + CS5535_PERIODS * sizeof(struct cs5535_prd);
     cs_writel(card, ACC_BM0_PRD, jmp_phys);
 
-    aui->card_samples_per_int = (card->period_size_bytes / 2) / 2; // bytes/bytespersample/channels
+    // clear any stale status
+    (void)cs_readb(card, ACC_BM0_STATUS);
+
+    aui->card_samples_per_int = (card->period_size_bytes / 2) / 2; // bytes / bytes-per-sample / channels
 }
 
 // ---------------------------------------------------------------------------
@@ -228,9 +265,11 @@ static void CS5535_close(struct mpxplay_audioout_info_s *aui);
 static void CS5535_card_info(struct mpxplay_audioout_info_s *aui)
 {
     cs5535_card_s *card = aui->card_private_data;
-    char sout[100];
-    sprintf(sout, "CS5535: AMD %s on port:%4.4X irq:%d",
-            card->pci_dev->device_name, (unsigned)card->iobase, (int)card->irq);
+    char sout[120];
+    sprintf(sout, "CS5535: AMD %s on port:%4.4X irq:%d codec:%4.4X%4.4X ext:%4.4X vra:%d rdy:%d",
+            card->pci_dev->device_name, (unsigned)card->iobase, (int)card->irq,
+            (unsigned)card->codec_id1, (unsigned)card->codec_id2, (unsigned)card->codec_ext_id,
+            (int)card->vra, (int)card->codec_ready);
     pds_textdisplay_printf(sout);
 }
 
@@ -254,10 +293,10 @@ static int CS5535_adetect(struct mpxplay_audioout_info_s *aui)
     if (pcibios_search_devices(cs5535_devices, card->pci_dev) != PCI_SUCCESSFUL)
         goto err_adetect;
 
-    pcibios_set_master(card->pci_dev);
+    pcibios_set_master(card->pci_dev);   // enable I/O space + bus mastering
 
-    // BAR0 holds the ACC I/O port base (bits 2:0 are flags; mask to 0xFFF8 or 0xFFF0)
-    card->iobase = pcibios_ReadConfig_Dword(card->pci_dev, PCIR_NAMBAR) & 0xFFF0;
+    // BAR0 holds the ACC I/O port base (bit 0 = I/O space flag, 128-byte region)
+    card->iobase = pcibios_ReadConfig_Dword(card->pci_dev, PCIR_NAMBAR) & 0xFFFC;
     if (!card->iobase)
         goto err_adetect;
 
@@ -270,8 +309,8 @@ static int CS5535_adetect(struct mpxplay_audioout_info_s *aui)
     cs_aclink_reset(card);
     cs_ac97_init(card, aui->freq_set);
 
-    // signal FM and MPU-401 via standard ports (CS5535 does not have onboard OPL/MPU)
-    aui->fm_port   = 0;
+    // CS5535/CS5536 has no onboard OPL/MPU-401
+    aui->fm_port     = 0;
     aui->mpu401_port = 0;
 
     return 1;
@@ -285,7 +324,8 @@ static void CS5535_close(struct mpxplay_audioout_info_s *aui)
 {
     cs5535_card_s *card = aui->card_private_data;
     if (card) {
-        cs_writeb(card, ACC_BM0_CMD, CS_BM_DIS);
+        if (card->iobase)
+            cs_writeb(card, ACC_BM0_CMD, CS_BM_DIS);
         MDma_free_cardmem(card->dm);
         if (card->pci_dev)
             pds_free(card->pci_dev);
@@ -297,6 +337,7 @@ static void CS5535_close(struct mpxplay_audioout_info_s *aui)
 static void CS5535_setrate(struct mpxplay_audioout_info_s *aui)
 {
     cs5535_card_s *card = aui->card_private_data;
+    unsigned int dmabufsize;
 
     aui->card_wave_id = MPXPLAY_WAVEID_PCM_SLE;
     aui->chan_card = 2;
@@ -309,8 +350,10 @@ static void CS5535_setrate(struct mpxplay_audioout_info_s *aui)
         if (aui->freq_card > 48000) aui->freq_card = 48000;
     }
 
-    unsigned int dmabufsize = MDma_init_pcmoutbuf(aui, card->pcmout_bufsize, CS5535_BDL_ALIGN, 0);
+    dmabufsize = MDma_init_pcmoutbuf(aui, card->pcmout_bufsize, CS5535_BDL_ALIGN, 0);
     card->period_size_bytes = dmabufsize / CS5535_PERIODS;
+    if (card->period_size_bytes > CS5535_MAX_PERIOD)
+        card->period_size_bytes = CS5535_MAX_PERIOD & ~3u;
 
     cs_prepare_playback(card, aui);
 }
@@ -330,24 +373,26 @@ static void CS5535_stop(struct mpxplay_audioout_info_s *aui)
 static long CS5535_getbufpos(struct mpxplay_audioout_info_s *aui)
 {
     cs5535_card_s *card = aui->card_private_data;
-    uint32_t buf_phys = (uint32_t)pds_cardmem_physicalptr(card->dm, card->pcmout_buffer);
-    uint32_t pntr    = cs_readl(card, ACC_BM0_PNTR);
+    uint32_t buf_phys, pntr, offset, bufpos, ring_bytes;
     int retry = 6;
 
+    if (!card->period_size_bytes)
+        return aui->card_dma_lastgoodpos;
+
+    buf_phys   = (uint32_t)pds_cardmem_physicalptr(card->dm, card->pcmout_buffer);
+    ring_bytes = card->period_size_bytes * CS5535_PERIODS;
+
     do {
-        if (pntr < buf_phys || pntr >= buf_phys + (uint32_t)card->pcmout_bufsize)
-            break;
-
-        uint32_t offset = pntr - buf_phys;
-        // Align to period boundary (same approach as ICH SBEMU mode)
-        uint32_t period_idx = offset / card->period_size_bytes;
-        if (period_idx >= (uint32_t)(CS5535_PERIODS - 1))
-            break;
-
-        uint32_t bufpos = period_idx * card->period_size_bytes;
-        if (bufpos < (uint32_t)aui->card_dmasize) {
-            aui->card_dma_lastgoodpos = bufpos;
-            break;
+        pntr = cs_readl(card, ACC_BM0_PNTR);
+        if (pntr >= buf_phys && pntr < buf_phys + ring_bytes) {
+            offset = pntr - buf_phys;
+            // Align to the start of the current period (like the ICH SBEMU mode):
+            // this keeps timing stable and free space is always a whole number of periods.
+            bufpos = (offset / card->period_size_bytes) * card->period_size_bytes;
+            if (bufpos < (uint32_t)aui->card_dmasize) {
+                aui->card_dma_lastgoodpos = bufpos;
+                break;
+            }
         }
     } while (--retry);
 
@@ -370,9 +415,9 @@ static int CS5535_IRQRoutine(struct mpxplay_audioout_info_s *aui)
     if (irq_stat & CS_IRQ_BM0_STS)
         (void)cs_readb(card, ACC_BM0_STATUS);
 
-    // ACK BM1 (capture) interrupt by reading BM1 status (0x29)
+    // ACK BM1 (capture) interrupt by reading BM1 status
     if (irq_stat & CS_IRQ_BM1_STS)
-        (void)inb(card->iobase + 0x29);
+        (void)cs_readb(card, ACC_BM1_STATUS);
 
     return 1;
 }
@@ -389,25 +434,6 @@ static unsigned long CS5535_readMIXER(struct mpxplay_audioout_info_s *aui, unsig
     cs5535_card_s *card = aui->card_private_data;
     return cs_codec_read(card, (uint8_t)reg);
 }
-
-// AC97 mixer channel descriptors (master + PCM, both stereo, reversed: 0 = max, 63 = mute)
-static aucards_onemixerchan_s CS5535_master_vol = {
-    AU_MIXCHANFUNCS_PACK(AU_MIXCHAN_MASTER, AU_MIXCHANFUNC_VOLUME), 2,
-    {{ AC97_MASTER_VOL_STEREO, 31, 8, SUBMIXCH_INFOBIT_REVERSEDVALUE },
-     { AC97_MASTER_VOL_STEREO, 31, 0, SUBMIXCH_INFOBIT_REVERSEDVALUE }}
-};
-
-static aucards_onemixerchan_s CS5535_pcm_vol = {
-    AU_MIXCHANFUNCS_PACK(AU_MIXCHAN_PCM, AU_MIXCHANFUNC_VOLUME), 2,
-    {{ AC97_PCMOUT_VOL, 31, 8, SUBMIXCH_INFOBIT_REVERSEDVALUE },
-     { AC97_PCMOUT_VOL, 31, 0, SUBMIXCH_INFOBIT_REVERSEDVALUE }}
-};
-
-static aucards_allmixerchan_s cs5535_mixerset[] = {
-    &CS5535_master_vol,
-    &CS5535_pcm_vol,
-    NULL
-};
 
 one_sndcard_info CS5535_sndcard_info = {
     "CS5535/CS5536 AC97",
@@ -430,12 +456,7 @@ one_sndcard_info CS5535_sndcard_info = {
 
     &CS5535_writeMIXER,
     &CS5535_readMIXER,
-    &cs5535_mixerset[0],
-
-    &ioport_fm_write,
-    &ioport_fm_read,
-    &ioport_mpu401_write_when_ready,
-    &ioport_mpu401_read,
+    &mpxplay_aucards_ac97chan_mixerset[0]
 };
 
 #endif // AU_CARDS_LINK_CS5535
